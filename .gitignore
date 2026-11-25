@@ -13,4 +13,3 @@ backend/api
 /backend/api
 
 .env
-/server.js

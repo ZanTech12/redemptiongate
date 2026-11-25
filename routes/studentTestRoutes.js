@@ -1,21 +1,100 @@
-// routes/studentTestRoutes.js
+
 const express = require('express');
 const router = express.Router();
-const authenticateToken = require('../middlewares/authMiddleware').authenticateToken;
-const checkResultAccess = require('../middlewares/resultMiddleware').checkResultAccess;
+
+const {
+    authenticateToken
+} = require('../middlewares/authMiddleware');
+
+const checkResultAccess =
+    require('../middlewares/resultMiddleware').checkResultAccess;
+
 const ctrl = require('../controllers/studentTestController');
-const mainCtrl = require('../controllers/testController'); // has getStudentTestById & submitTest
- dashboardController = require('../controllers/dashboardController');   // ✅ ADD THIS
+const mainCtrl = require('../controllers/testController');
 
-// ---- STATIC ROUTES (before :id) ----
-router.get('/dashboard', authenticateToken, dashboardController.getStudentDashboard);  // ✅ ADD THIS
-router.get('/tests', authenticateToken, mainCtrl.getStudentTests);
-router.get('/all-tests', authenticateToken, ctrl.getStudentAllTests);
-router.get('/test-schedule', authenticateToken, ctrl.getStudentTestSchedule);
-router.get('/test-results', authenticateToken, checkResultAccess, ctrl.getStudentTestResults);
+const dashboardController =
+    require('../controllers/dashboardController');
 
-// ---- DYNAMIC ROUTES (LAST) ----
-router.get('/tests/:id', authenticateToken, mainCtrl.getStudentTestById);
-router.post('/tests/:id/submit', authenticateToken, mainCtrl.submitTest);
+// Validate all required handlers.
+const requiredHandlers = {
+    authenticateToken,
+    checkResultAccess,
+    getStudentDashboard: dashboardController.getStudentDashboard,
+    getStudentTests: mainCtrl.getStudentTests,
+    getStudentAllTests: ctrl.getStudentAllTests,
+    getStudentTestSchedule: ctrl.getStudentTestSchedule,
+    getStudentTestResults: ctrl.getStudentTestResults,
+    getStudentTestById: mainCtrl.getStudentTestById,
+    startStudentTest: ctrl.startStudentTest,
+    saveTestAnswers: ctrl.saveTestAnswers,
+    submitTest: mainCtrl.submitTest
+};
+
+for (const [name, handler] of Object.entries(requiredHandlers)) {
+    if (typeof handler !== 'function') {
+        throw new TypeError(
+            `studentTestRoutes.js: ${name} is not a function. Check its controller export.`
+        );
+    }
+}
+
+// Student dashboard.
+router.get(
+    '/dashboard',
+    authenticateToken,
+    dashboardController.getStudentDashboard
+);
+
+// Student tests.
+router.get(
+    '/tests',
+    authenticateToken,
+    mainCtrl.getStudentTests
+);
+
+router.get(
+    '/all-tests',
+    authenticateToken,
+    ctrl.getStudentAllTests
+);
+
+router.get(
+    '/test-schedule',
+    authenticateToken,
+    ctrl.getStudentTestSchedule
+);
+
+router.get(
+    '/test-results',
+    authenticateToken,
+    checkResultAccess,
+    ctrl.getStudentTestResults
+);
+
+// Timed test attempts.
+router.post(
+    '/tests/:id/start',
+    authenticateToken,
+    ctrl.startStudentTest
+);
+
+router.put(
+    '/tests/:id/answers',
+    authenticateToken,
+    ctrl.saveTestAnswers
+);
+
+// Test details and submission.
+router.get(
+    '/tests/:id',
+    authenticateToken,
+    mainCtrl.getStudentTestById
+);
+
+router.post(
+    '/tests/:id/submit',
+    authenticateToken,
+    mainCtrl.submitTest
+);
 
 module.exports = router;

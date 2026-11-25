@@ -1,5 +1,5 @@
 // ===================================================================
-// ✅ SYNC ROUTE — v4.1 (router version)
+// ✅ SYNC ROUTE — v4.2 (router version)
 // ✅ Pre-flight schema check on the SOURCE (refuses to dump a stale
 //    schema — permanently breaks the "data missing until db push" loop)
 // ✅ Strict exit codes (exit 1 = FAILURE, never "success")
@@ -10,6 +10,10 @@
 //    target URL HARDCODED — the Prisma CLI lets .env override real
 //    env vars, which previously made the "Neon" step hit localhost.
 //    The 🔎 Target lines show exactly which database is being pushed.
+// ✅ FIXED v4.2: Restore now pipes pg_restore → pg_attver filter →
+//    psql. Neon dumps contain "ALTER COLUMN ... SET (pg_attver=...)"
+//    which standard PostgreSQL rejects with "unrecognized parameter
+//    pg_attver". The filter strips those lines before psql sees them.
 // ===================================================================
 
 const express = require('express');
@@ -18,9 +22,10 @@ const fs = require('fs');
 const path = require('path');
 const os = require('os');
 const { spawn } = require('child_process');
+const { Transform } = require('stream');
 const { authenticateToken } = require('../middlewares/authMiddleware');
 
-console.log('📌 SYNC ROUTE v4.1 (router) LOADED — hardcoded-URL schema push; .env cannot hijack the target');
+console.log('📌 SYNC ROUTE v4.2 (router) LOADED — pg_attver filtering + hardcoded-URL schema push');
 
 // ---------------- PostgreSQL tools ----------------
 const getPGBinDir = () => {
@@ -41,6 +46,7 @@ const getPGBinDir = () => {
 const PG_BIN_DIR = getPGBinDir();
 const PG_DUMP_PATH = path.join(PG_BIN_DIR, 'pg_dump.exe');
 const PG_RESTORE_PATH = path.join(PG_BIN_DIR, 'pg_restore.exe');
+const PSQL_PATH = path.join(PG_BIN_DIR, 'psql.exe');
 console.log(`🛠️  PostgreSQL tools directory: ${PG_BIN_DIR}`);
 
 const SYNC_TIMEOUT_MS = 30 * 60 * 1000;
@@ -85,6 +91,58 @@ const parseConn = (urlStr) => {
 
 let syncInProgress = false; // ✅ one sync at a time
 
+// ================================================================
+// pg_attver FILTER STREAM
+//
+// Neon's PostgreSQL fork adds an internal column versioning
+// parameter ("pg_attver") to every column. pg_dump on Neon
+// emits statements like:
+//
+//   ALTER TABLE ... ALTER COLUMN col SET (pg_attver=268767664);
+//
+// Standard PostgreSQL rejects these with:
+//   ERROR: unrecognized parameter "pg_attver"
+//
+// This Transform streams the pg_restore SQL output line-by-line
+// and drops any line containing "pg_attver" before the SQL
+// reaches psql. The statements are purely Neon-internal and
+// removing them has zero effect on data or schema.
+// ================================================================
+const createPgAttverFilter = () => {
+    let leftover = '';
+
+    return new Transform({
+        transform(chunk, encoding, callback) {
+            // Accumulate and split on newlines so we never
+            // accidentally filter a partial line.
+            leftover += chunk.toString();
+
+            const lines = leftover.split('\n');
+            // Keep the last (possibly incomplete) chunk.
+            leftover = lines.pop();
+
+            const kept = lines.filter(
+                (line) => !line.includes('pg_attver')
+            );
+
+            if (kept.length > 0) {
+                this.push(kept.join('\n') + '\n');
+            }
+
+            callback();
+        },
+
+        flush(callback) {
+            // Flush any remaining data in the buffer.
+            if (leftover && !leftover.includes('pg_attver')) {
+                this.push(leftover);
+            }
+            leftover = '';
+            callback();
+        }
+    });
+};
+
 router.post('/:direction', authenticateToken, async (req, res) => {
     // ---------------- validation BEFORE the SSE stream ----------------
     if (!['admin', 'superadmin'].includes(req.user.role)) {
@@ -103,6 +161,12 @@ router.post('/:direction', authenticateToken, async (req, res) => {
         return res.status(500).json({
             success: false,
             message: `pg_dump/pg_restore not found in "${PG_BIN_DIR}". Bundle PostgreSQL in resources/postgres or set PG_BIN_PATH.`
+        });
+    }
+    if (!fs.existsSync(PSQL_PATH)) {
+        return res.status(500).json({
+            success: false,
+            message: `psql not found in "${PG_BIN_DIR}". The restore step needs psql.exe alongside pg_dump.exe and pg_restore.exe.`
         });
     }
     if (syncInProgress) {
@@ -125,7 +189,13 @@ router.post('/:direction', authenticateToken, async (req, res) => {
     const cleanup = () => {
         if (fs.existsSync(tempFile)) { try { fs.unlinkSync(tempFile); } catch (e) {} }
     };
+
+    // ✅ Guard against double-finish (two child processes
+    //    in the restore step could both trigger completion).
+    let finished = false;
     const finish = () => {
+        if (finished) return;
+        finished = true;
         syncInProgress = false;
         cleanup();
         res.end();
@@ -215,6 +285,139 @@ router.post('/:direction', authenticateToken, async (req, res) => {
         });
     };
 
+    // ================================================================
+    // ✅ RESTORE STEP — v4.2 FIXED
+    //
+    //    pg_restore (generates SQL from custom-format dump)
+    //        ↓ stdout
+    //    pg_attver filter (Transform stream — drops Neon-only lines)
+    //        ↓ stdout
+    //    psql (executes cleaned SQL against the target database)
+    //
+    //    --single-transaction + ON_ERROR_STOP=1 on the psql side
+    //    means any error rolls back the ENTIRE restore — the target
+    //    database is left completely unchanged on failure.
+    // ================================================================
+    const runRestoreStep = (targetConn, targetUrl, targetLabel, onComplete) => {
+        // --- pg_restore: read the dump file and emit SQL to stdout ---
+        // No --dbname flag → SQL goes to stdout instead of direct restore.
+        // --clean --if-exists → emit DROP ... IF EXISTS before each CREATE.
+        // --no-owner --no-privileges --no-comments → strip ownership/ACLs.
+        const restoreGenArgs = [
+            `--host=${targetConn.host}`,
+            `--port=${targetConn.port}`,
+            `--username=${targetConn.user}`,
+            '--clean',
+            '--if-exists',
+            '--no-owner',
+            '--no-privileges',
+            '--no-comments',
+            tempFile
+        ];
+
+        // --- psql: read filtered SQL from stdin and execute ---
+        // --single-transaction → wraps everything in BEGIN/COMMIT.
+        // --set ON_ERROR_STOP=1 → halt on first error (triggers rollback).
+        const psqlArgs = [
+            `--host=${targetConn.host}`,
+            `--port=${targetConn.port}`,
+            `--username=${targetConn.user}`,
+            `--dbname=${targetConn.database}`,
+            '--single-transaction',
+            '--set=ON_ERROR_STOP=1',  // halt on first error → rollback
+            '--quiet',     // suppress SQL echo, keep stderr clean
+            '-f', '-'      // read SQL from stdin
+        ];
+
+        const restoreGen = spawn(PG_RESTORE_PATH, restoreGenArgs, {
+            env: { ...process.env, PGPASSWORD: targetConn.password }
+        });
+
+        const psql = spawn(PSQL_PATH, psqlArgs, {
+            env: { ...process.env, PGPASSWORD: targetConn.password }
+        });
+
+        // ✅ Track BOTH processes so the disconnect handler
+        //    and timeout can kill them together.
+        activeChild = {
+            kill: () => {
+                try { restoreGen.kill(); } catch (e) {}
+                try { psql.kill(); } catch (e) {}
+            }
+        };
+
+        // Create the pg_attver filter and wire the pipe:
+        //   pg_restore.stdout → filter → psql.stdin
+        const attverFilter = createPgAttverFilter();
+        restoreGen.stdout.pipe(attverFilter).pipe(psql.stdin);
+
+        // Timeout — kills both processes.
+        const restoreTimer = setTimeout(() => {
+            sendEvent("❌ Restore timed out — aborting. Target database will be left unchanged.");
+            try { restoreGen.kill(); } catch (e) {}
+            try { psql.kill(); } catch (e) {}
+        }, SYNC_TIMEOUT_MS);
+
+        // --- stderr from both processes → SSE ---
+        restoreGen.stderr.on('data', (data) => {
+            const msg = data.toString().trim();
+            if (msg) sendEvent(`Restore Log: ${msg}`);
+        });
+
+        psql.stderr.on('data', (data) => {
+            const msg = data.toString().trim();
+            if (msg) sendEvent(`Restore Log: ${msg}`);
+        });
+
+        // --- Error handlers (spawn failure) ---
+        restoreGen.on('error', (err) => {
+            clearTimeout(restoreTimer);
+            sendEvent(`❌ Spawn Error (pg_restore): ${err.message}`);
+            try { psql.kill(); } catch (e) {}
+            onComplete(false);
+        });
+
+        psql.on('error', (err) => {
+            clearTimeout(restoreTimer);
+            sendEvent(`❌ Spawn Error (psql): ${err.message}`);
+            try { restoreGen.kill(); } catch (e) {}
+            onComplete(false);
+        });
+
+        // --- restoreGen completion ---
+        // If pg_restore exits with a non-zero code, the dump file
+        // may be corrupted. Kill psql so it doesn't hang waiting
+        // for input that will never arrive.
+        restoreGen.on('close', (code) => {
+            if (code !== 0 && code !== null) {
+                sendEvent(`❌ pg_restore could not read the dump file (exit code ${code}).`);
+                try { psql.kill(); } catch (e) {}
+            }
+            // If code === 0, pg_restore finished emitting SQL.
+            // psql will continue executing until it processes
+            // everything and then exit on its own.
+        });
+
+        // --- psql completion — THE authoritative signal ---
+        // When psql exits, the restore is definitively done
+        // (success or failure). Its exit code tells us which.
+        psql.on('close', (code) => {
+            clearTimeout(restoreTimer);
+
+            if (code !== 0) {
+                sendEvent(
+                    `❌ Restore FAILED (exit code ${code}). ` +
+                    `The target database was left UNCHANGED (rolled back). ` +
+                    `Check the Restore Log above.`
+                );
+                return onComplete(false);
+            }
+
+            sendEvent("✅ Restore complete.");
+            onComplete(true);
+        });
+    };
+
     try {
         let sourceConn, targetConn, sourceUrl, targetUrl, sourceLabel, targetLabel;
         if (direction === 'to-local') {
@@ -275,49 +478,11 @@ router.post('/:direction', authenticateToken, async (req, res) => {
                     return finish();
                 }
 
-                sendEvent("✅ Dump complete. Starting restore...");
+                sendEvent("✅ Dump complete. Starting restore (v4.2 — pg_attver filter active)...");
 
-                const restoreArgs = [
-                    `--host=${targetConn.host}`,
-                    `--port=${targetConn.port}`,
-                    `--username=${targetConn.user}`,
-                    `--dbname=${targetConn.database}`,
-                    '--clean',
-                    '--if-exists',
-                    '--no-owner',
-                    '--no-privileges',
-                    '--no-comments',
-                    '--single-transaction', // atomic: failure = target untouched
-                    tempFile
-                ];
-
-                const restore = spawn(PG_RESTORE_PATH, restoreArgs, { env: { ...process.env, PGPASSWORD: targetConn.password } });
-                activeChild = restore;
-
-                const restoreTimer = setTimeout(() => {
-                    sendEvent("❌ Restore timed out — aborting. Target database will be left unchanged.");
-                    try { restore.kill(); } catch (e) {}
-                }, SYNC_TIMEOUT_MS);
-
-                restore.stderr.on('data', (data) => {
-                    const msg = data.toString().trim();
-                    if (msg) sendEvent(`Restore Log: ${msg}`);
-                });
-
-                restore.on('error', (err) => {
-                    clearTimeout(restoreTimer);
-                    sendEvent(`❌ Spawn Error: ${err.message}`);
-                    finish();
-                });
-
-                restore.on('close', (code) => {
-                    clearTimeout(restoreTimer);
-                    if (code !== 0) {
-                        sendEvent(`❌ Restore FAILED (exit code ${code}). The target database was left UNCHANGED (rolled back). Check the Restore Log above.`);
-                        return finish();
-                    }
-
-                    sendEvent("✅ Restore complete.");
+                // ✅ v4.2: Restore with pg_attver filtering.
+                runRestoreStep(targetConn, targetUrl, targetLabel, (restoreOk) => {
+                    if (!restoreOk) return finish();
 
                     // ✅ POST-RESTORE: repair/verify the TARGET schema.
                     runSchemaStep(targetUrl, targetLabel, false, () => {

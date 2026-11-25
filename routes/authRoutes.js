@@ -1,13 +1,14 @@
+
 const express = require('express');
 const router = express.Router();
 const authController = require('../controllers/authController');
 
 // ===================================================================
-// *** AUTH ROUTES ***
+// AUTH ROUTES
 // ===================================================================
 
 // @route   POST /login
-// @desc    General Login (handles superadmin, admin, teacher, student based on 'role' in body)
+// @desc    General Login (superadmin, admin, teacher, student)
 router.post('/', authController.login);
 
 // @route   POST /login/superadmin
@@ -15,15 +16,31 @@ router.post('/', authController.login);
 router.post('/superadmin', authController.loginSuperAdmin);
 
 // @route   POST /login/admin
-// @desc    Dedicated Admin Login (Checks expiry & active status)
+// @desc    Dedicated Admin Login (checks expiry and active status)
 router.post('/admin', authController.loginAdmin);
 
 // @route   POST /login/teacher
-// @desc    Dedicated Teacher Login (Tracks last login IP/Device)
+// @desc    Dedicated Teacher Login (tracks last login IP/device)
 router.post('/teacher', authController.loginTeacher);
 
 // @route   POST /login/student
-// @desc    Dedicated Student Login (Checks fees & admission number)
+// @desc    Dedicated Student Login (checks fees and admission number)
 router.post('/student', authController.loginStudent);
+
+// ===================================================================
+// REFRESH TOKEN ROUTES
+// ===================================================================
+
+// @route   POST /login/refresh
+// @desc    Validate and rotate refresh token
+router.post('/refresh', authController.refreshToken);
+
+// ===================================================================
+// LOGOUT ROUTES
+// ===================================================================
+
+// @route   POST /login/logout
+// @desc    Revoke refresh token
+router.post('/logout', authController.logout);
 
 module.exports = router;
