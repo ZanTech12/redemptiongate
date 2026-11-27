@@ -1,8 +1,14 @@
 
 const OpenAI = require('openai');
 const PDFDocument = require('pdfkit');
+const SVGtoPDF = require('svg-to-pdfkit');
 const cloudinary = require('cloudinary').v2;
 const prisma = require('../config/db');
+
+// ============================================================
+// RGSS ADVANCED AI LESSON NOTE GENERATOR
+// GROQ + LATEX + MATHJAX + PDFKIT + CLOUDINARY
+// ============================================================
 
 // ============================================================
 // CLOUDINARY CONFIGURATION
@@ -27,8 +33,61 @@ const GROQ_MODEL =
 const groq = new OpenAI({
     apiKey: GROQ_API_KEY,
     baseURL: 'https://api.groq.com/openai/v1',
-    timeout: 120000,
+    timeout: 180000,
 });
+
+// ============================================================
+// MATHJAX CONFIGURATION
+// ============================================================
+
+let mathJaxDocument = null;
+let mathJaxAdaptor = null;
+
+const initializeMathJax = () => {
+    if (mathJaxDocument) return;
+
+    const { mathjax } = require('mathjax-full/js/mathjax.js');
+    const { TeX } = require('mathjax-full/js/input/tex.js');
+    const { SVG } = require('mathjax-full/js/output/svg.js');
+    const { liteAdaptor } = require('mathjax-full/js/adaptors/liteAdaptor.js');
+    const { RegisterHTMLHandler } = require('mathjax-full/js/handlers/html.js');
+    const { AllPackages } = require('mathjax-full/js/input/tex/AllPackages.js');
+
+    mathJaxAdaptor = liteAdaptor();
+
+    RegisterHTMLHandler(mathJaxAdaptor);
+
+    const tex = new TeX({
+        packages: AllPackages,
+        inlineMath: [['$', '$'], ['\\(', '\\)']],
+        displayMath: [['$$', '$$'], ['\\[', '\\]']],
+        processEscapes: true,
+    });
+
+    const svg = new SVG({
+        fontCache: 'none',
+        scale: 1,
+    });
+
+    mathJaxDocument = mathjax.document('', {
+        InputJax: tex,
+        OutputJax: svg,
+    });
+};
+
+const renderLatexToSvg = (latex, display = true) => {
+    initializeMathJax();
+
+    if (typeof latex !== 'string' || !latex.trim()) {
+        throw new Error('Invalid mathematical expression.');
+    }
+
+    const node = mathJaxDocument.convert(latex.trim(), {
+        display,
+    });
+
+    return mathJaxAdaptor.outerHTML(node);
+};
 
 // ============================================================
 // HELPER FUNCTIONS
@@ -69,6 +128,63 @@ const parseAIJson = (text) => {
     return JSON.parse(cleaned);
 };
 
+const cleanArray = (value) => {
+    return Array.isArray(value) ? value : [];
+};
+
+const cleanString = (value, fallback = '') => {
+    return typeof value === 'string' ? value.trim() : fallback;
+};
+
+const normalizeLessonContent = (content) => {
+    const arrayFields = [
+        'subTopics',
+        'learningObjectives',
+        'instructionalMaterials',
+        'keyTerms',
+        'formulaSheet',
+        'workedExamples',
+        'practicalApplications',
+        'diagramDescriptions',
+        'teacherActivities',
+        'studentActivities',
+        'differentiatedLearning',
+        'commonMisconceptions',
+        'evaluationQuestions',
+        'evaluationAnswers',
+        'assignment',
+        'references',
+        'furtherReading',
+    ];
+
+    arrayFields.forEach((field) => {
+        if (!Array.isArray(content[field])) {
+            content[field] = [];
+        }
+    });
+
+    if (!Array.isArray(content.lessonContent)) {
+        content.lessonContent = [];
+    }
+
+    content.lessonContent = content.lessonContent.filter(
+        isValidObject
+    );
+
+    content.lessonContent.forEach((section) => {
+        section.examples = cleanArray(section.examples);
+        section.keyTerms = cleanArray(section.keyTerms);
+        section.formulas = cleanArray(section.formulas);
+        section.workedExamples = cleanArray(section.workedExamples);
+        section.practicalApplications = cleanArray(section.practicalApplications);
+        section.diagramDescriptions = cleanArray(section.diagramDescriptions);
+        section.commonMisconceptions = cleanArray(section.commonMisconceptions);
+        section.activities = cleanArray(section.activities);
+    });
+
+    return content;
+};
+
 // ============================================================
 // CLOUDINARY HELPERS
 // ============================================================
@@ -81,15 +197,11 @@ const isCloudinaryConfigured = () => {
     );
 };
 
-// Upload a PDF Buffer to Cloudinary as a raw file.
-
 const uploadPdfToCloudinary = (pdfBuffer, filename) => {
     return new Promise((resolve, reject) => {
         if (!isCloudinaryConfigured()) {
             return reject(
-                new Error(
-                    'Cloudinary is not configured. Check your environment variables.'
-                )
+                new Error('Cloudinary is not configured.')
             );
         }
 
@@ -110,15 +222,11 @@ const uploadPdfToCloudinary = (pdfBuffer, filename) => {
                 format: 'pdf',
             },
             (error, result) => {
-                if (error) {
-                    return reject(error);
-                }
+                if (error) return reject(error);
 
                 if (!result || !result.secure_url || !result.public_id) {
                     return reject(
-                        new Error(
-                            'Cloudinary did not return a valid PDF URL.'
-                        )
+                        new Error('Cloudinary did not return a valid PDF URL.')
                     );
                 }
 
@@ -135,8 +243,6 @@ const uploadPdfToCloudinary = (pdfBuffer, filename) => {
     });
 };
 
-// Delete a previously uploaded PDF.
-
 const deleteCloudinaryPdf = async (publicId) => {
     if (!publicId) return;
 
@@ -151,28 +257,18 @@ const deleteCloudinaryPdf = async (publicId) => {
             result.result !== 'ok' &&
             result.result !== 'not found'
         ) {
-            console.warn(
-                '[CLOUDINARY PDF DELETE] Unexpected result:',
-                result
-            );
-        } else {
-            console.log(
-                '[CLOUDINARY PDF DELETE] Result:',
-                result.result,
-                publicId
-            );
+            console.warn('[CLOUDINARY DELETE]:', result);
         }
     } catch (error) {
         console.error(
-            '[CLOUDINARY PDF DELETE ERROR]:',
-            publicId,
+            '[CLOUDINARY DELETE ERROR]:',
             error.message
         );
     }
 };
 
 // ============================================================
-// PDF HELPER FUNCTIONS
+// PDF CONFIGURATION
 // ============================================================
 
 const safeFilename = (value) => {
@@ -184,13 +280,9 @@ const safeFilename = (value) => {
 };
 
 const pdfText = (value) => {
-    if (value === null || value === undefined) {
-        return '';
-    }
+    if (value === null || value === undefined) return '';
 
-    if (typeof value === 'string') {
-        return value.trim();
-    }
+    if (typeof value === 'string') return value.trim();
 
     if (
         typeof value === 'number' ||
@@ -200,10 +292,7 @@ const pdfText = (value) => {
     }
 
     if (Array.isArray(value)) {
-        return value
-            .map(pdfText)
-            .filter(Boolean)
-            .join(', ');
+        return value.map(pdfText).filter(Boolean).join(', ');
     }
 
     if (typeof value === 'object') {
@@ -212,8 +301,6 @@ const pdfText = (value) => {
 
     return '';
 };
-
-// PDF DESIGN COLOURS
 
 const PDF_COLORS = {
     primary: '#174C45',
@@ -227,8 +314,6 @@ const PDF_COLORS = {
     white: '#FFFFFF',
     paleGold: '#FBF7EC',
 };
-
-// PDF DIMENSIONS
 
 const PDF_LAYOUT = {
     left: 58,
@@ -245,8 +330,6 @@ const getPdfContentWidth = (doc) => {
     );
 };
 
-// Keep content away from the footer.
-
 const ensurePdfSpace = (doc, requiredHeight = 45) => {
     const bottomLimit =
         doc.page.height - doc.page.margins.bottom;
@@ -257,7 +340,7 @@ const ensurePdfSpace = (doc, requiredHeight = 45) => {
 };
 
 // ============================================================
-// PDF PAGE HEADER
+// PDF HEADER
 // ============================================================
 
 const drawPdfHeader = (doc) => {
@@ -265,56 +348,38 @@ const drawPdfHeader = (doc) => {
 
     doc.save();
 
-    // Main top banner.
-
-    doc
-        .rect(0, 0, pageWidth, 10)
+    doc.rect(0, 0, pageWidth, 10)
         .fill(PDF_COLORS.primary);
 
-    // Gold accent line.
-
-    doc
-        .rect(0, 10, pageWidth, 3)
+    doc.rect(0, 10, pageWidth, 3)
         .fill(PDF_COLORS.accent);
-
-    // Header branding.
 
     doc
         .font('Helvetica-Bold')
         .fontSize(9)
         .fillColor(PDF_COLORS.primary)
-        .text(
-            'RGSS',
-            PDF_LAYOUT.left,
-            27,
-            {
-                lineBreak: false,
-            }
-        );
+        .text('RGSS', PDF_LAYOUT.left, 27, {
+            lineBreak: false,
+        });
+
+    doc
+        .font('Helvetica')
+        .fontSize(8)
+        .fillColor(PDF_COLORS.muted)
+        .text('AI LESSON NOTE', PDF_LAYOUT.left + 34, 28, {
+            lineBreak: false,
+        });
 
     doc
         .font('Helvetica')
         .fontSize(8)
         .fillColor(PDF_COLORS.muted)
         .text(
-            'AI LESSON NOTE',
-            PDF_LAYOUT.left + 34,
+            'ADVANCED TEACHER RESOURCE',
+            pageWidth - PDF_LAYOUT.right - 150,
             28,
             {
-                lineBreak: false,
-            }
-        );
-
-    doc
-        .font('Helvetica')
-        .fontSize(8)
-        .fillColor(PDF_COLORS.muted)
-        .text(
-            'TEACHER RESOURCE',
-            pageWidth - PDF_LAYOUT.right - 110,
-            28,
-            {
-                width: 110,
+                width: 150,
                 align: 'right',
                 lineBreak: false,
             }
@@ -338,14 +403,8 @@ const addPdfFooter = (doc) => {
         doc.save();
 
         doc
-            .moveTo(
-                PDF_LAYOUT.left,
-                footerY - 10
-            )
-            .lineTo(
-                doc.page.width - PDF_LAYOUT.right,
-                footerY - 10
-            )
+            .moveTo(PDF_LAYOUT.left, footerY - 10)
+            .lineTo(doc.page.width - PDF_LAYOUT.right, footerY - 10)
             .lineWidth(0.7)
             .strokeColor(PDF_COLORS.border)
             .stroke();
@@ -355,12 +414,10 @@ const addPdfFooter = (doc) => {
             .fontSize(7.5)
             .fillColor(PDF_COLORS.primary)
             .text(
-                'RGSS  |  AI LESSON NOTE',
+                'RGSS | ADVANCED AI LESSON NOTE',
                 PDF_LAYOUT.left,
                 footerY,
-                {
-                    lineBreak: false,
-                }
+                { lineBreak: false }
             );
 
         doc
@@ -386,18 +443,12 @@ const addPdfFooter = (doc) => {
 // PDF SECTION HEADING
 // ============================================================
 
-const addPdfHeading = (
-    doc,
-    heading,
-    options = {}
-) => {
+const addPdfHeading = (doc, heading, options = {}) => {
     const value = pdfText(heading);
-
     if (!value) return;
 
     const size = options.size || 12.5;
     const contentWidth = getPdfContentWidth(doc);
-    const compact = options.compact === true;
 
     const textWidth = contentWidth - 30;
 
@@ -408,72 +459,43 @@ const addPdfHeading = (
         lineGap: 2,
     });
 
-    const boxHeight = Math.max(
-        27,
-        headingHeight + 13
-    );
+    const boxHeight = Math.max(27, headingHeight + 13);
 
     ensurePdfSpace(doc, boxHeight + 18);
 
     const x = doc.page.margins.left;
-    const y = doc.y + (compact ? 3 : 8);
-
-    // Heading background.
+    const y = doc.y + (options.compact ? 3 : 8);
 
     doc
         .save()
-        .roundedRect(
-            x,
-            y,
-            contentWidth,
-            boxHeight,
-            5
-        )
+        .roundedRect(x, y, contentWidth, boxHeight, 5)
         .fill(PDF_COLORS.light)
         .restore();
 
-    // Accent bar.
-
     doc
         .save()
-        .roundedRect(
-            x,
-            y,
-            4,
-            boxHeight,
-            2
-        )
+        .roundedRect(x, y, 4, boxHeight, 2)
         .fill(PDF_COLORS.secondary)
         .restore();
-
-    // Heading text.
 
     doc
         .font('Helvetica-Bold')
         .fontSize(size)
-        .fillColor(
-            options.color || PDF_COLORS.primary
-        )
-        .text(
-            value,
-            x + 14,
-            y + 7,
-            {
-                width: textWidth,
-                lineGap: 2,
-            }
-        );
+        .fillColor(options.color || PDF_COLORS.primary)
+        .text(value, x + 14, y + 7, {
+            width: textWidth,
+            lineGap: 2,
+        });
 
     doc.y = y + boxHeight + 8;
 };
 
 // ============================================================
-// NORMAL BODY PARAGRAPH
+// BASIC PDF PARAGRAPH
 // ============================================================
 
-const addPdfParagraph = (doc, value, options = {}) => {
+const addPdfPlainParagraph = (doc, value, options = {}) => {
     const text = pdfText(value);
-
     if (!text) return;
 
     const fontSize = options.fontSize || 11.5;
@@ -503,21 +525,203 @@ const addPdfParagraph = (doc, value, options = {}) => {
 };
 
 // ============================================================
-// ATTRACTIVE BULLET LIST
+// LATEX DETECTION
+// SUPPORTS:
+// $...$
+// $$...$$
+// \(...\)
+// \[...\]
 // ============================================================
 
-const addPdfList = (doc, items, options = {}) => {
-    if (!Array.isArray(items) || !items.length) {
-        return;
+const splitLatexContent = (value) => {
+    const text = String(value || '');
+
+    const regex =
+        /(\$\$[\s\S]+?\$\$|\\\[[\s\S]+?\\\]|\\\([\s\S]+?\\\]|(?<!\\)\$[^$\n]+\$)/g;
+
+    const segments = [];
+
+    let lastIndex = 0;
+    let match;
+
+    while ((match = regex.exec(text)) !== null) {
+        if (match.index > lastIndex) {
+            segments.push({
+                type: 'text',
+                value: text.slice(lastIndex, match.index),
+            });
+        }
+
+        const expression = match[0];
+
+        let latex = expression;
+
+        if (expression.startsWith('$$')) {
+            latex = expression.slice(2, -2);
+        } else if (expression.startsWith('\\[')) {
+            latex = expression.slice(2, -2);
+        } else if (expression.startsWith('\\(')) {
+            latex = expression.slice(2, -2);
+        } else if (expression.startsWith('$')) {
+            latex = expression.slice(1, -1);
+        }
+
+        segments.push({
+            type: 'math',
+            value: latex.trim(),
+        });
+
+        lastIndex = regex.lastIndex;
     }
+
+    if (lastIndex < text.length) {
+        segments.push({
+            type: 'text',
+            value: text.slice(lastIndex),
+        });
+    }
+
+    return segments;
+};
+
+// ============================================================
+// RENDER LATEX INTO PDF
+// ============================================================
+
+const addPdfMath = async (doc, latex, options = {}) => {
+    try {
+        const svgMarkup = renderLatexToSvg(latex, true);
+
+        const viewBoxMatch = svgMarkup.match(
+            /viewBox=["']([^"']+)["']/
+        );
+
+        if (!viewBoxMatch) {
+            throw new Error('Invalid MathJax SVG viewBox.');
+        }
+
+        const dimensions = viewBoxMatch[1]
+            .trim()
+            .split(/\s+/)
+            .map(Number);
+
+        const originalWidth = dimensions[2];
+        const originalHeight = dimensions[3];
+
+        if (
+            !originalWidth ||
+            !originalHeight ||
+            !Number.isFinite(originalWidth) ||
+            !Number.isFinite(originalHeight)
+        ) {
+            throw new Error('Invalid mathematical dimensions.');
+        }
+
+        const contentWidth = getPdfContentWidth(doc);
+
+        const desiredWidth = Math.min(
+            contentWidth,
+            Math.max(70, originalWidth * 0.55)
+        );
+
+        const desiredHeight =
+            desiredWidth * (originalHeight / originalWidth);
+
+        ensurePdfSpace(doc, desiredHeight + 20);
+
+        const x =
+            doc.page.margins.left +
+            (contentWidth - desiredWidth) / 2;
+
+        const y = doc.y + 5;
+
+        doc.save();
+
+        SVGtoPDF(
+            doc,
+            svgMarkup,
+            x,
+            y,
+            {
+                width: desiredWidth,
+                height: desiredHeight,
+                preserveAspectRatio: 'xMidYMid meet',
+            }
+        );
+
+        doc.restore();
+
+        doc.y = y + desiredHeight + 10;
+
+    } catch (error) {
+        console.error(
+            '[LATEX PDF RENDER ERROR]:',
+            error.message
+        );
+
+        addPdfPlainParagraph(
+            doc,
+            `Mathematical expression: ${latex}`,
+            { fontSize: 9.5 }
+        );
+    }
+};
+
+// ============================================================
+// LATEX-AWARE PARAGRAPH
+// ============================================================
+
+const addPdfParagraph = async (doc, value, options = {}) => {
+    const segments = splitLatexContent(pdfText(value));
+
+    for (const segment of segments) {
+        if (!segment.value.trim()) continue;
+
+        if (segment.type === 'math') {
+            await addPdfMath(doc, segment.value, options);
+        } else {
+            await addPdfPlainParagraph(doc, segment.value, options);
+        }
+    }
+};
+
+// ============================================================
+// PDF BULLET LIST
+// ============================================================
+
+const addPdfList = async (doc, items, options = {}) => {
+    if (!Array.isArray(items) || !items.length) return;
 
     const fontSize = options.fontSize || 11.2;
     const contentWidth = getPdfContentWidth(doc);
 
-    items.forEach((item) => {
+    for (const item of items) {
         const value = pdfText(item);
+        if (!value) continue;
 
-        if (!value) return;
+        const segments = splitLatexContent(value);
+
+        const containsMath = segments.some(
+            segment => segment.type === 'math'
+        );
+
+        if (containsMath) {
+            doc
+                .save()
+                .circle(
+                    doc.page.margins.left + 5,
+                    doc.y + 7,
+                    2
+                )
+                .fill(PDF_COLORS.accent)
+                .restore();
+
+            await addPdfParagraph(doc, value, {
+                fontSize,
+            });
+
+            continue;
+        }
 
         const textHeight = doc.heightOfString(value, {
             width: contentWidth - 24,
@@ -530,8 +734,6 @@ const addPdfList = (doc, items, options = {}) => {
 
         const bulletY = doc.y + 4;
 
-        // Bullet marker.
-
         doc
             .save()
             .circle(
@@ -541,8 +743,6 @@ const addPdfList = (doc, items, options = {}) => {
             )
             .fill(PDF_COLORS.accent)
             .restore();
-
-        // Bullet text.
 
         doc
             .font('Helvetica')
@@ -554,16 +754,151 @@ const addPdfList = (doc, items, options = {}) => {
                 doc.y,
                 {
                     width: contentWidth - 17,
-                    align: 'left',
                     lineGap: 3.5,
                     paragraphGap: 5,
                 }
             );
 
         doc.moveDown(0.2);
-    });
+    }
 
     doc.moveDown(0.2);
+};
+
+// ============================================================
+// KEY TERM / DEFINITION PANEL
+// ============================================================
+
+const addPdfKeyTerms = async (doc, terms) => {
+    if (!Array.isArray(terms) || !terms.length) return;
+
+    for (const item of terms) {
+        if (typeof item === 'string') {
+            await addPdfParagraph(doc, item);
+            continue;
+        }
+
+        if (!isValidObject(item)) continue;
+
+        const term = pdfText(item.term || item.name);
+        const definition = pdfText(
+            item.definition || item.meaning
+        );
+
+        if (!term && !definition) continue;
+
+        ensurePdfSpace(doc, 65);
+
+        const y = doc.y;
+        const x = doc.page.margins.left;
+        const width = getPdfContentWidth(doc);
+
+        doc
+            .save()
+            .roundedRect(x, y, width, 48, 5)
+            .fill(PDF_COLORS.paleGold)
+            .restore();
+
+        doc
+            .font('Helvetica-Bold')
+            .fontSize(10.5)
+            .fillColor(PDF_COLORS.primary)
+            .text(term, x + 12, y + 8, {
+                width: width - 24,
+            });
+
+        doc.y = y + 27;
+
+        if (definition) {
+            await addPdfParagraph(doc, definition, {
+                fontSize: 10,
+            });
+        }
+
+        doc.moveDown(0.3);
+    }
+};
+
+// ============================================================
+// WORKED EXAMPLES
+// ============================================================
+
+const addPdfWorkedExamples = async (doc, examples) => {
+    if (!Array.isArray(examples) || !examples.length) return;
+
+    for (let index = 0; index < examples.length; index++) {
+        const example = examples[index];
+
+        if (typeof example === 'string') {
+            addPdfHeading(
+                doc,
+                `Worked Example ${index + 1}`,
+                { size: 10.5, compact: true }
+            );
+
+            await addPdfParagraph(doc, example);
+            continue;
+        }
+
+        if (!isValidObject(example)) continue;
+
+        addPdfHeading(
+            doc,
+            example.title || `Worked Example ${index + 1}`,
+            { size: 10.5, compact: true }
+        );
+
+        if (example.question) {
+            await addPdfParagraph(doc, `Question: ${example.question}`);
+        }
+
+        if (example.given) {
+            addPdfParagraph(doc, `Given: ${pdfText(example.given)}`);
+        }
+
+        if (example.formula) {
+            addPdfHeading(doc, 'Formula', {
+                size: 9.5,
+                compact: true,
+            });
+
+            await addPdfParagraph(doc, example.formula);
+        }
+
+        if (example.steps) {
+            const steps = Array.isArray(example.steps)
+                ? example.steps
+                : [example.steps];
+
+            for (let step = 0; step < steps.length; step++) {
+                await addPdfParagraph(
+                    doc,
+                    `${step + 1}. ${pdfText(steps[step])}`,
+                    { fontSize: 10.5 }
+                );
+            }
+        }
+
+        if (example.solution) {
+            addPdfHeading(doc, 'Solution', {
+                size: 9.5,
+                compact: true,
+            });
+
+            await addPdfParagraph(doc, example.solution);
+        }
+
+        if (example.answer !== undefined) {
+            await addPdfParagraph(
+                doc,
+                `Final Answer: ${pdfText(example.answer)}`
+            );
+        }
+
+        if (example.explanation) {
+            await addPdfParagraph(doc, example.explanation);
+        }
+    }
 };
 
 // ============================================================
@@ -595,49 +930,26 @@ const addLessonInformationPanel = (doc, information) => {
 
     const y = doc.y;
 
-    // Main panel background.
-
     doc
         .save()
-        .roundedRect(
-            x,
-            y,
-            contentWidth,
-            panelHeight,
-            8
-        )
+        .roundedRect(x, y, contentWidth, panelHeight, 8)
         .fill(PDF_COLORS.light)
         .restore();
 
-    // Panel top accent.
-
     doc
         .save()
-        .roundedRect(
-            x,
-            y,
-            contentWidth,
-            5,
-            3
-        )
+        .roundedRect(x, y, contentWidth, 5, 3)
         .fill(PDF_COLORS.primary)
         .restore();
-
-    // Panel title.
 
     doc
         .font('Helvetica-Bold')
         .fontSize(9)
         .fillColor(PDF_COLORS.primary)
-        .text(
-            'LESSON OVERVIEW',
-            x + 14,
-            y + 15,
-            {
-                lineBreak: false,
-                characterSpacing: 0.5,
-            }
-        );
+        .text('LESSON OVERVIEW', x + 14, y + 15, {
+            lineBreak: false,
+            characterSpacing: 0.5,
+        });
 
     validInformation.forEach(([label, value], index) => {
         const column = index % 2;
@@ -646,12 +958,9 @@ const addLessonInformationPanel = (doc, information) => {
         const itemX =
             x + 14 + column * (columnWidth + columnGap);
 
-        const itemY =
-            y + 40 + row * rowHeight;
+        const itemY = y + 40 + row * rowHeight;
 
         const availableWidth = columnWidth - 15;
-
-        // Field label.
 
         doc
             .font('Helvetica-Bold')
@@ -668,29 +977,22 @@ const addLessonInformationPanel = (doc, information) => {
                 }
             );
 
-        // Field value.
-
         doc
             .font('Helvetica')
             .fontSize(9.5)
             .fillColor(PDF_COLORS.dark)
-            .text(
-                pdfText(value),
-                itemX,
-                itemY + 12,
-                {
-                    width: availableWidth,
-                    height: 22,
-                    ellipsis: true,
-                }
-            );
+            .text(pdfText(value), itemX, itemY + 12, {
+                width: availableWidth,
+                height: 22,
+                ellipsis: true,
+            });
     });
 
     doc.y = y + panelHeight + 12;
 };
 
 // ============================================================
-// DOCUMENT TITLE PANEL
+// PDF TITLE
 // ============================================================
 
 const addPdfTitle = (doc, title) => {
@@ -707,59 +1009,33 @@ const addPdfTitle = (doc, title) => {
         align: 'center',
     });
 
-    const panelHeight = Math.max(
-        88,
-        titleHeight + 55
-    );
+    const panelHeight = Math.max(88, titleHeight + 55);
 
     ensurePdfSpace(doc, panelHeight + 15);
 
     const y = doc.y;
 
-    // Title background.
-
     doc
         .save()
-        .roundedRect(
-            x,
-            y,
-            contentWidth,
-            panelHeight,
-            9
-        )
+        .roundedRect(x, y, contentWidth, panelHeight, 9)
         .fill(PDF_COLORS.primary)
         .restore();
 
-    // Gold accent.
-
     doc
         .save()
-        .roundedRect(
-            x + 18,
-            y + 17,
-            36,
-            4,
-            2
-        )
+        .roundedRect(x + 18, y + 17, 36, 4, 2)
         .fill(PDF_COLORS.accent)
         .restore();
-
-    // Title.
 
     doc
         .font('Helvetica-Bold')
         .fontSize(20)
         .fillColor(PDF_COLORS.white)
-        .text(
-            cleanTitle,
-            x + 20,
-            y + 31,
-            {
-                width: contentWidth - 40,
-                align: 'center',
-                lineGap: 3,
-            }
-        );
+        .text(cleanTitle, x + 20, y + 31, {
+            width: contentWidth - 40,
+            align: 'center',
+            lineGap: 3,
+        });
 
     doc.y = y + panelHeight + 9;
 
@@ -767,312 +1043,447 @@ const addPdfTitle = (doc, title) => {
         .font('Helvetica')
         .fontSize(8)
         .fillColor(PDF_COLORS.muted)
-        .text(
-            'PREPARED FOR CLASSROOM TEACHING',
-            {
-                align: 'center',
-                characterSpacing: 0.7,
-            }
-        );
+        .text('PREPARED FOR CLASSROOM TEACHING', {
+            align: 'center',
+            characterSpacing: 0.7,
+        });
 
     doc.moveDown(0.8);
 };
 
 // ============================================================
-// GENERATE PROFESSIONAL LESSON NOTE PDF
+// GENERIC PDF CONTENT SECTION
 // ============================================================
 
-const generateLessonNotePdf = (note) => {
-    return new Promise((resolve, reject) => {
-        try {
-            if (!note || !isValidObject(note.content)) {
-                return reject(
-                    new Error(
-                        'Invalid lesson note content for PDF generation.'
-                    )
-                );
-            }
+const addPdfGenericSection = async (
+    doc,
+    heading,
+    value,
+    options = {}
+) => {
+    if (
+        value === null ||
+        value === undefined ||
+        value === ''
+    ) {
+        return;
+    }
 
-            const content = note.content;
-
-            const doc = new PDFDocument({
-                size: 'A4',
-
-                margins: {
-                    top: PDF_LAYOUT.top,
-                    bottom: PDF_LAYOUT.bottom,
-                    left: PDF_LAYOUT.left,
-                    right: PDF_LAYOUT.right,
-                },
-
-                bufferPages: true,
-
-                autoFirstPage: true,
-
-                info: {
-                    Title: note.title || 'AI Lesson Note',
-                    Author: 'RGSS',
-                    Subject: note.topic || 'Lesson Note',
-                    Creator: 'RGSS AI Lesson Note Generator',
-                },
-            });
-
-            const chunks = [];
-
-            doc.on('data', (chunk) => {
-                chunks.push(chunk);
-            });
-
-            doc.on('error', reject);
-
-            // Draw the branded header on every new page.
-
-            doc.on('pageAdded', () => {
-                drawPdfHeader(doc);
-            });
-
-            // Draw header on the first page.
-
-            drawPdfHeader(doc);
-
-            doc.on('end', () => {
-                resolve(Buffer.concat(chunks));
-            });
-
-            // ----------------------------------------------------
-            // DOCUMENT TITLE
-            // ----------------------------------------------------
-
-            addPdfTitle(
-                doc,
-                note.title ||
-                content.title ||
-                'LESSON NOTE'
-            );
-
-            // ----------------------------------------------------
-            // LESSON INFORMATION
-            // ----------------------------------------------------
-
-            const information = [
-                ['Subject', content.subject],
-                ['Class', content.className],
-                ['Class Level', content.classLevel],
-                ['Academic Term', content.term || note.term],
-                ['Week', content.week || note.weekTitle],
-                ['Topic', content.topic || note.topic],
-                [
-                    'Duration',
-                    content.lessonDuration
-                        ? `${content.lessonDuration} minutes`
-                        : note.lessonDuration
-                            ? `${note.lessonDuration} minutes`
-                            : '',
-                ],
-            ];
-
-            addLessonInformationPanel(doc, information);
-
-            // ----------------------------------------------------
-            // SUBTOPICS
-            // ----------------------------------------------------
-
-            if (
-                Array.isArray(content.subTopics) &&
-                content.subTopics.length
-            ) {
-                addPdfHeading(doc, 'SUBTOPICS');
-                addPdfList(doc, content.subTopics);
-            }
-
-            // ----------------------------------------------------
-            // LEARNING OBJECTIVES
-            // ----------------------------------------------------
-
-            if (
-                Array.isArray(content.learningObjectives) &&
-                content.learningObjectives.length
-            ) {
-                addPdfHeading(doc, 'LEARNING OBJECTIVES');
-                addPdfList(doc, content.learningObjectives);
-            }
-
-            // ----------------------------------------------------
-            // INSTRUCTIONAL MATERIALS
-            // ----------------------------------------------------
-
-            if (
-                Array.isArray(content.instructionalMaterials) &&
-                content.instructionalMaterials.length
-            ) {
-                addPdfHeading(doc, 'INSTRUCTIONAL MATERIALS');
-                addPdfList(doc, content.instructionalMaterials);
-            }
-
-            // ----------------------------------------------------
-            // PREVIOUS KNOWLEDGE
-            // ----------------------------------------------------
-
-            if (content.previousKnowledge) {
-                addPdfHeading(doc, 'PREVIOUS KNOWLEDGE');
-                addPdfParagraph(doc, content.previousKnowledge);
-            }
-
-            // ----------------------------------------------------
-            // INTRODUCTION
-            // ----------------------------------------------------
-
-            if (content.introduction) {
-                addPdfHeading(doc, 'INTRODUCTION');
-                addPdfParagraph(doc, content.introduction);
-            }
-
-            // ----------------------------------------------------
-            // DETAILED LESSON CONTENT
-            // ----------------------------------------------------
-
-            if (
-                Array.isArray(content.lessonContent) &&
-                content.lessonContent.length
-            ) {
-                addPdfHeading(
-                    doc,
-                    'DETAILED LESSON CONTENT',
-                    { size: 14 }
-                );
-
-                content.lessonContent.forEach((section, index) => {
-                    if (!isValidObject(section)) return;
-
-                    addPdfHeading(
-                        doc,
-                        section.heading ||
-                        `Lesson Section ${index + 1}`,
-                        {
-                            size: 11.5,
-                            compact: true,
-                        }
-                    );
-
-                    if (section.explanation) {
-                        addPdfParagraph(
-                            doc,
-                            section.explanation
-                        );
-                    }
-
-                    if (
-                        Array.isArray(section.examples) &&
-                        section.examples.length
-                    ) {
-                        addPdfHeading(
-                            doc,
-                            'Examples',
-                            {
-                                size: 10.5,
-                                compact: true,
-                            }
-                        );
-
-                        addPdfList(
-                            doc,
-                            section.examples,
-                            { fontSize: 10.8 }
-                        );
-                    }
-                });
-            }
-
-            // ----------------------------------------------------
-            // TEACHER ACTIVITIES
-            // ----------------------------------------------------
-
-            if (
-                Array.isArray(content.teacherActivities) &&
-                content.teacherActivities.length
-            ) {
-                addPdfHeading(doc, 'TEACHER ACTIVITIES');
-                addPdfList(doc, content.teacherActivities);
-            }
-
-            // ----------------------------------------------------
-            // STUDENT ACTIVITIES
-            // ----------------------------------------------------
-
-            if (
-                Array.isArray(content.studentActivities) &&
-                content.studentActivities.length
-            ) {
-                addPdfHeading(doc, 'STUDENT ACTIVITIES');
-                addPdfList(doc, content.studentActivities);
-            }
-
-            // ----------------------------------------------------
-            // EVALUATION QUESTIONS
-            // ----------------------------------------------------
-
-            if (
-                Array.isArray(content.evaluationQuestions) &&
-                content.evaluationQuestions.length
-            ) {
-                addPdfHeading(doc, 'EVALUATION QUESTIONS');
-                addPdfList(doc, content.evaluationQuestions);
-            }
-
-            // ----------------------------------------------------
-            // LESSON SUMMARY
-            // ----------------------------------------------------
-
-            if (content.summary) {
-                addPdfHeading(doc, 'LESSON SUMMARY');
-                addPdfParagraph(doc, content.summary);
-            }
-
-            // ----------------------------------------------------
-            // ASSIGNMENT
-            // ----------------------------------------------------
-
-            if (
-                Array.isArray(content.assignment) &&
-                content.assignment.length
-            ) {
-                addPdfHeading(doc, 'ASSIGNMENT');
-                addPdfList(doc, content.assignment);
-            }
-
-            // ----------------------------------------------------
-            // REFERENCES
-            // ----------------------------------------------------
-
-            if (
-                Array.isArray(content.references) &&
-                content.references.length
-            ) {
-                addPdfHeading(doc, 'REFERENCES');
-
-                addPdfList(
-                    doc,
-                    content.references,
-                    { fontSize: 10.5 }
-                );
-            }
-
-            // ----------------------------------------------------
-            // FOOTERS AND PAGE NUMBERS
-            // ----------------------------------------------------
-
-            addPdfFooter(doc);
-
-            doc.end();
-
-        } catch (error) {
-            reject(error);
-        }
+    addPdfHeading(doc, heading, {
+        size: options.size || 11.5,
+        compact: options.compact === true,
     });
+
+    if (Array.isArray(value)) {
+        if (options.definitions) {
+            await addPdfKeyTerms(doc, value);
+        } else {
+            await addPdfList(doc, value);
+        }
+    } else if (isValidObject(value)) {
+        await addPdfParagraph(doc, pdfText(value));
+    } else {
+        await addPdfParagraph(doc, value);
+    }
 };
 
 // ============================================================
-// REMOVE UNNECESSARY PDF DATA FROM API RESPONSES
+// GENERATE ADVANCED LESSON NOTE PDF
+// ============================================================
+
+const generateLessonNotePdf = async (note) => {
+    if (!note || !isValidObject(note.content)) {
+        throw new Error('Invalid lesson note content.');
+    }
+
+    const content = note.content;
+
+    const doc = new PDFDocument({
+        size: 'A4',
+
+        margins: {
+            top: PDF_LAYOUT.top,
+            bottom: PDF_LAYOUT.bottom,
+            left: PDF_LAYOUT.left,
+            right: PDF_LAYOUT.right,
+        },
+
+        bufferPages: true,
+        autoFirstPage: true,
+
+        info: {
+            Title: note.title || 'AI Lesson Note',
+            Author: 'RGSS',
+            Subject: note.topic || 'Lesson Note',
+            Creator: 'RGSS Advanced AI Lesson Note Generator',
+        },
+    });
+
+    const chunks = [];
+
+    const pdfPromise = new Promise((resolve, reject) => {
+        doc.on('data', chunk => chunks.push(chunk));
+        doc.on('error', reject);
+        doc.on('end', () => resolve(Buffer.concat(chunks)));
+    });
+
+    doc.on('pageAdded', () => drawPdfHeader(doc));
+
+    drawPdfHeader(doc);
+
+    try {
+        // TITLE
+
+        addPdfTitle(
+            doc,
+            note.title || content.title || 'LESSON NOTE'
+        );
+
+        // OVERVIEW
+
+        addLessonInformationPanel(doc, [
+            ['Subject', content.subject],
+            ['Class', content.className],
+            ['Class Level', content.classLevel],
+            ['Academic Term', content.term || note.term],
+            ['Week', content.week || note.weekTitle],
+            ['Topic', content.topic || note.topic],
+            [
+                'Duration',
+                content.lessonDuration
+                    ? `${content.lessonDuration} minutes`
+                    : note.lessonDuration
+                        ? `${note.lessonDuration} minutes`
+                        : '',
+            ],
+        ]);
+
+        // SUBTOPICS
+
+        await addPdfGenericSection(
+            doc,
+            'SUBTOPICS',
+            content.subTopics
+        );
+
+        // OBJECTIVES
+
+        await addPdfGenericSection(
+            doc,
+            'LEARNING OBJECTIVES',
+            content.learningObjectives
+        );
+
+        // LEARNING OUTCOMES
+
+        await addPdfGenericSection(
+            doc,
+            'EXPECTED LEARNING OUTCOMES',
+            content.learningOutcomes
+        );
+
+        // MATERIALS
+
+        await addPdfGenericSection(
+            doc,
+            'INSTRUCTIONAL MATERIALS',
+            content.instructionalMaterials
+        );
+
+        // KEY TERMS
+
+        await addPdfGenericSection(
+            doc,
+            'KEY TERMS AND DEFINITIONS',
+            content.keyTerms,
+            { definitions: true }
+        );
+
+        // PREVIOUS KNOWLEDGE
+
+        await addPdfGenericSection(
+            doc,
+            'PREVIOUS KNOWLEDGE',
+            content.previousKnowledge
+        );
+
+        // INTRODUCTION
+
+        await addPdfGenericSection(
+            doc,
+            'INTRODUCTION',
+            content.introduction
+        );
+
+        // LESSON CONTENT
+
+        if (content.lessonContent.length) {
+            addPdfHeading(doc, 'COMPREHENSIVE LESSON CONTENT', {
+                size: 14,
+            });
+
+            for (
+                let index = 0;
+                index < content.lessonContent.length;
+                index++
+            ) {
+                const section = content.lessonContent[index];
+
+                addPdfHeading(
+                    doc,
+                    section.heading ||
+                    `Lesson Section ${index + 1}`,
+                    {
+                        size: 12,
+                        compact: true,
+                    }
+                );
+
+                if (section.explanation) {
+                    await addPdfParagraph(
+                        doc,
+                        section.explanation
+                    );
+                }
+
+                if (section.keyTerms.length) {
+                    addPdfHeading(doc, 'Important Terms', {
+                        size: 10,
+                        compact: true,
+                    });
+
+                    await addPdfKeyTerms(
+                        doc,
+                        section.keyTerms
+                    );
+                }
+
+                if (section.formulas.length) {
+                    addPdfHeading(doc, 'Formulas and Principles', {
+                        size: 10,
+                        compact: true,
+                    });
+
+                    await addPdfWorkedExamples(
+                        doc,
+                        section.formulas
+                    );
+                }
+
+                if (section.examples.length) {
+                    addPdfHeading(doc, 'Examples', {
+                        size: 10,
+                        compact: true,
+                    });
+
+                    await addPdfList(
+                        doc,
+                        section.examples,
+                        { fontSize: 10.8 }
+                    );
+                }
+
+                if (section.workedExamples.length) {
+                    addPdfHeading(doc, 'Worked Examples', {
+                        size: 10,
+                        compact: true,
+                    });
+
+                    await addPdfWorkedExamples(
+                        doc,
+                        section.workedExamples
+                    );
+                }
+
+                if (section.practicalApplications.length) {
+                    addPdfHeading(doc, 'Practical Applications', {
+                        size: 10,
+                        compact: true,
+                    });
+
+                    await addPdfList(
+                        doc,
+                        section.practicalApplications
+                    );
+                }
+
+                if (section.diagramDescriptions.length) {
+                    addPdfHeading(doc, 'Diagrams and Illustrations', {
+                        size: 10,
+                        compact: true,
+                    });
+
+                    await addPdfList(
+                        doc,
+                        section.diagramDescriptions
+                    );
+                }
+
+                if (section.commonMisconceptions.length) {
+                    addPdfHeading(doc, 'Common Misconceptions', {
+                        size: 10,
+                        compact: true,
+                    });
+
+                    await addPdfList(
+                        doc,
+                        section.commonMisconceptions
+                    );
+                }
+
+                if (section.activities.length) {
+                    addPdfHeading(doc, 'Section Activities', {
+                        size: 10,
+                        compact: true,
+                    });
+
+                    await addPdfList(doc, section.activities);
+                }
+            }
+        }
+
+        // GLOBAL FORMULA SHEET
+
+        if (content.formulaSheet.length) {
+            addPdfHeading(doc, 'FORMULA SHEET', {
+                size: 13,
+            });
+
+            await addPdfWorkedExamples(
+                doc,
+                content.formulaSheet
+            );
+        }
+
+        // GLOBAL WORKED EXAMPLES
+
+        if (content.workedExamples.length) {
+            addPdfHeading(doc, 'ADDITIONAL WORKED EXAMPLES', {
+                size: 13,
+            });
+
+            await addPdfWorkedExamples(
+                doc,
+                content.workedExamples
+            );
+        }
+
+        // APPLICATIONS
+
+        await addPdfGenericSection(
+            doc,
+            'REAL-LIFE AND PRACTICAL APPLICATIONS',
+            content.practicalApplications
+        );
+
+        // DIAGRAMS
+
+        await addPdfGenericSection(
+            doc,
+            'DIAGRAMS AND ILLUSTRATIONS',
+            content.diagramDescriptions
+        );
+
+        // TEACHING ACTIVITIES
+
+        await addPdfGenericSection(
+            doc,
+            'TEACHER ACTIVITIES',
+            content.teacherActivities
+        );
+
+        await addPdfGenericSection(
+            doc,
+            'STUDENT ACTIVITIES',
+            content.studentActivities
+        );
+
+        // DIFFERENTIATED LEARNING
+
+        await addPdfGenericSection(
+            doc,
+            'DIFFERENTIATED LEARNING',
+            content.differentiatedLearning
+        );
+
+        // MISCONCEPTIONS
+
+        await addPdfGenericSection(
+            doc,
+            'COMMON STUDENT MISCONCEPTIONS AND CORRECTIONS',
+            content.commonMisconceptions
+        );
+
+        // EVALUATION
+
+        await addPdfGenericSection(
+            doc,
+            'EVALUATION QUESTIONS',
+            content.evaluationQuestions
+        );
+
+        // ANSWERS
+
+        await addPdfGenericSection(
+            doc,
+            'SUGGESTED ANSWERS AND MARKING GUIDE',
+            content.evaluationAnswers
+        );
+
+        // SUMMARY
+
+        await addPdfGenericSection(
+            doc,
+            'COMPREHENSIVE LESSON SUMMARY',
+            content.summary
+        );
+
+        // CONCLUSION
+
+        await addPdfGenericSection(
+            doc,
+            'CONCLUSION',
+            content.conclusion
+        );
+
+        // ASSIGNMENT
+
+        await addPdfGenericSection(
+            doc,
+            'ASSIGNMENT',
+            content.assignment
+        );
+
+        // REFERENCES
+
+        await addPdfGenericSection(
+            doc,
+            'REFERENCES',
+            content.references
+        );
+
+        // FURTHER READING
+
+        await addPdfGenericSection(
+            doc,
+            'FURTHER READING',
+            content.furtherReading
+        );
+
+        addPdfFooter(doc);
+
+        doc.end();
+
+        return await pdfPromise;
+
+    } catch (error) {
+        doc.destroy();
+        throw error;
+    }
+};
+
+// ============================================================
+// REMOVE PDF BINARY DATA
 // ============================================================
 
 const removePdfBinary = (note) => {
@@ -1086,7 +1497,7 @@ const removePdfBinary = (note) => {
 
 // ============================================================
 // AUTHENTICATION CONTEXT
-// SUPPORTS ADMIN AND TEACHER
+// ADMIN AND TEACHER
 // ============================================================
 
 const getUserContext = (req) => {
@@ -1218,7 +1629,7 @@ const getNoteAccessFilter = (context) => {
 };
 
 // ============================================================
-// VERIFY NOTE CREATOR
+// CREATOR DATA
 // ============================================================
 
 const getCreatorData = (context) => {
@@ -1230,6 +1641,329 @@ const getCreatorData = (context) => {
         createdByRole: context.role,
     };
 };
+
+// ============================================================
+// ADVANCED AI SYSTEM PROMPT
+// ============================================================
+
+const SYSTEM_PROMPT = `
+You are RGSS Advanced AI Academic Assistant.
+
+You are an expert Nigerian secondary school teacher,
+professional curriculum developer, educational researcher,
+textbook author, subject specialist and examination educator.
+
+Your task is to produce comprehensive, accurate and
+professionally structured educational lesson notes.
+
+EDUCATIONAL STANDARDS:
+
+1. Use clear, professional educational English.
+2. Adapt every explanation to the specified class and age group.
+3. Follow appropriate Nigerian secondary school curriculum
+   expectations and NERDC learning objectives where applicable.
+4. Do not claim that a note has been officially approved by NERDC.
+5. Never invent official curriculum references.
+6. Explain concepts thoroughly instead of providing short definitions.
+7. Organize topics from fundamental concepts to advanced concepts
+   appropriate to the selected class.
+8. Provide sufficient teaching material for classroom delivery.
+9. Use Nigerian examples where relevant.
+10. Ensure all scientific, mathematical and technical information
+    is accurate.
+11. Avoid repetitive explanations and unnecessary filler.
+12. Maintain a logical progression between sections.
+
+MATHEMATICAL AND LATEX REQUIREMENTS:
+
+For Mathematics, Further Mathematics, Physics, Chemistry,
+Basic Science and other subjects involving mathematical notation:
+
+1. Use LaTeX for mathematical expressions.
+2. Use \\( ... \\) for inline mathematical expressions.
+3. Use \\[ ... \\] for display equations.
+4. Use proper mathematical fractions, powers, subscripts,
+   superscripts, roots, summations, integrals and symbols.
+5. Explain every important symbol and variable.
+6. Show complete calculations step by step.
+7. Include units where applicable.
+8. Explain the formula before applying it.
+9. Include the substitution of values.
+10. Include the final answer and interpretation.
+11. Do not put mathematical expressions inside ordinary code blocks.
+12. Ensure LaTeX is syntactically valid.
+13. Use \\mathrm{} for ordinary words inside mathematical expressions.
+14. Do not replace mathematical expressions with plain-text approximations.
+
+PHYSICS REQUIREMENTS:
+
+Where relevant, include:
+- Physical principles and laws.
+- SI units.
+- Derived units.
+- Symbols and dimensions.
+- Relevant equations.
+- Mathematical derivations.
+- Worked numerical problems.
+- Practical experiments.
+- Observations and conclusions.
+- Real-life applications.
+
+CHEMISTRY REQUIREMENTS:
+
+Where relevant, include:
+- Chemical symbols.
+- Chemical formulae.
+- Balanced chemical equations.
+- Reaction conditions.
+- Physical and chemical properties.
+- Laboratory procedures.
+- Safety precautions.
+- Chemical calculations.
+- Relevant observations.
+
+MATHEMATICS REQUIREMENTS:
+
+Where relevant, include:
+- Definitions.
+- Rules and principles.
+- Formulae.
+- Step-by-step solutions.
+- Multiple worked examples.
+- Different approaches to solving problems.
+- Common errors.
+- Exercises of increasing difficulty.
+
+BIOLOGY REQUIREMENTS:
+
+Where relevant, include:
+- Biological structures.
+- Functions.
+- Classification.
+- Processes and mechanisms.
+- Relevant labelled diagram descriptions.
+- Practical observations.
+- Applications.
+
+OTHER SUBJECTS:
+
+Adapt the structure to the subject. Do not force
+mathematical content into subjects where it is unnecessary.
+
+ADVANCED CONTENT REQUIREMENTS:
+
+Include the following wherever relevant:
+
+1. Detailed introduction.
+2. Previous knowledge.
+3. Learning objectives.
+4. Expected learning outcomes.
+5. Instructional materials.
+6. Key terms and definitions.
+7. Detailed explanations.
+8. Principles and laws.
+9. Formulae and derivations.
+10. Worked examples.
+11. Practical applications.
+12. Classroom activities.
+13. Diagram descriptions.
+14. Common misconceptions.
+15. Differentiated learning activities.
+16. Evaluation questions.
+17. Suggested answers.
+18. Marking guide.
+19. Comprehensive summary.
+20. Assignment.
+21. References.
+22. Further reading.
+
+WORKED EXAMPLE REQUIREMENTS:
+
+Where appropriate, provide at least three worked examples.
+
+Each worked example should contain:
+- Question.
+- Given information.
+- Relevant formula.
+- Explanation of the formula.
+- Step-by-step solution.
+- Correct units.
+- Final answer.
+- Interpretation.
+
+REFERENCE REQUIREMENTS:
+
+Only recommend genuine and relevant educational references
+when known with reasonable confidence.
+
+Never fabricate:
+- Textbook titles.
+- Authors.
+- Publishers.
+- Editions.
+- Page numbers.
+- URLs.
+- Official examination requirements.
+
+When uncertain, recommend a general subject textbook
+without inventing bibliographic details.
+
+CONTENT DEPTH:
+
+Produce textbook-style explanations appropriate to the
+specified class level.
+
+Do not sacrifice accuracy or age suitability for length.
+
+Use meaningful examples and explanations.
+
+Return ONLY valid JSON.
+
+Do not include Markdown code fences.
+`;
+
+// ============================================================
+// ADVANCED LESSON NOTE JSON TEMPLATE
+// ============================================================
+
+const createLessonTemplate = ({
+    subjectName,
+    className,
+    classLevel,
+    termName,
+    weekTitle,
+    topic,
+    duration,
+    subTopics,
+}) => ({
+    title: 'Comprehensive Lesson Title',
+    subject: subjectName,
+    className,
+    classLevel,
+    term: termName,
+    week: weekTitle,
+    topic,
+    lessonDuration: duration,
+
+    subTopics,
+
+    learningObjectives: [
+        'Detailed measurable learning objective',
+    ],
+
+    learningOutcomes: [
+        'What students should understand and demonstrate',
+    ],
+
+    instructionalMaterials: [],
+
+    previousKnowledge: '',
+
+    introduction: '',
+
+    keyTerms: [
+        {
+            term: '',
+            definition: '',
+        },
+    ],
+
+    lessonContent: [
+        {
+            heading: 'Introduction to the Concept',
+
+            explanation: '',
+
+            keyTerms: [
+                {
+                    term: '',
+                    definition: '',
+                },
+            ],
+
+            formulas: [
+                {
+                    title: '',
+                    formula: '',
+                    explanation: '',
+                    variables: [],
+                    units: [],
+                },
+            ],
+
+            examples: [],
+
+            workedExamples: [
+                {
+                    title: '',
+                    question: '',
+                    given: '',
+                    formula: '',
+                    steps: [],
+                    answer: '',
+                    explanation: '',
+                },
+            ],
+
+            practicalApplications: [],
+
+            diagramDescriptions: [],
+
+            commonMisconceptions: [],
+
+            activities: [],
+        },
+    ],
+
+    formulaSheet: [],
+
+    workedExamples: [],
+
+    practicalApplications: [],
+
+    diagramDescriptions: [],
+
+    teacherActivities: [],
+
+    studentActivities: [],
+
+    differentiatedLearning: [
+        {
+            level: 'Additional support',
+            activity: '',
+        },
+        {
+            level: 'Standard learning',
+            activity: '',
+        },
+        {
+            level: 'Advanced learners',
+            activity: '',
+        },
+    ],
+
+    commonMisconceptions: [],
+
+    evaluationQuestions: [],
+
+    evaluationAnswers: [
+        {
+            questionNumber: 1,
+            answer: '',
+            markingGuide: [],
+        },
+    ],
+
+    summary: '',
+
+    conclusion: '',
+
+    assignment: [],
+
+    references: [],
+
+    furtherReading: [],
+});
 
 // ============================================================
 // 1. GET AVAILABLE ACADEMIC TERMS
@@ -1252,9 +1986,11 @@ exports.getAvailableTerms = async (req, res) => {
             where: {
                 adminId: context.adminId,
             },
+
             orderBy: {
                 startDate: 'desc',
             },
+
             select: {
                 id: true,
                 name: true,
@@ -1274,7 +2010,7 @@ exports.getAvailableTerms = async (req, res) => {
         });
 
     } catch (error) {
-        console.error('[GET AVAILABLE TERMS ERROR]:', error);
+        console.error('[GET TERMS ERROR]:', error);
 
         return sendError(
             res,
@@ -1286,7 +2022,7 @@ exports.getAvailableTerms = async (req, res) => {
 
 // ============================================================
 // 2. GET AVAILABLE E-NOTES WEEKS
-// GET /lesson-notes/weeks?classId=1&termId=2
+// GET /lesson-notes/weeks
 // ============================================================
 
 exports.getAvailableWeeks = async (req, res) => {
@@ -1294,14 +2030,8 @@ exports.getAvailableWeeks = async (req, res) => {
         const context = getUserContext(req);
 
         if (!context) {
-            return sendError(
-                res,
-                403,
-                'Invalid account or school administrator information.'
-            );
+            return sendError(res, 403, 'Invalid account.');
         }
-
-        const { adminId } = context;
 
         const classId = parseId(req.query.classId);
         const termId = parseId(req.query.termId);
@@ -1318,7 +2048,7 @@ exports.getAvailableWeeks = async (req, res) => {
             prisma.class.findFirst({
                 where: {
                     id: classId,
-                    adminId,
+                    adminId: context.adminId,
                     isActive: true,
                 },
             }),
@@ -1326,25 +2056,17 @@ exports.getAvailableWeeks = async (req, res) => {
             prisma.term.findFirst({
                 where: {
                     id: termId,
-                    adminId,
+                    adminId: context.adminId,
                 },
             }),
         ]);
 
         if (!schoolClass) {
-            return sendError(
-                res,
-                404,
-                'Selected class was not found in your school.'
-            );
+            return sendError(res, 404, 'Class not found.');
         }
 
         if (!term) {
-            return sendError(
-                res,
-                404,
-                'Selected academic term was not found.'
-            );
+            return sendError(res, 404, 'Academic term not found.');
         }
 
         const hasAccess = await verifyTeacherClassAccess({
@@ -1363,13 +2085,15 @@ exports.getAvailableWeeks = async (req, res) => {
 
         const weeks = await prisma.eNoteWeek.findMany({
             where: {
-                adminId,
+                adminId: context.adminId,
                 classId,
                 termId,
             },
+
             orderBy: {
                 createdAt: 'asc',
             },
+
             select: {
                 id: true,
                 title: true,
@@ -1379,7 +2103,7 @@ exports.getAvailableWeeks = async (req, res) => {
             },
         });
 
-        return res.status(200).json({
+        return res.json({
             success: true,
             count: weeks.length,
             role: context.role,
@@ -1399,7 +2123,7 @@ exports.getAvailableWeeks = async (req, res) => {
         });
 
     } catch (error) {
-        console.error('[GET AVAILABLE WEEKS ERROR]:', error);
+        console.error('[GET WEEKS ERROR]:', error);
 
         return sendError(
             res,
@@ -1410,11 +2134,8 @@ exports.getAvailableWeeks = async (req, res) => {
 };
 
 // ============================================================
-// 3. GENERATE AI LESSON NOTE
+// 3. GENERATE ADVANCED AI LESSON NOTE
 // POST /lesson-notes/generate
-//
-// GENERATES AND SAVES A DRAFT.
-// PDF IS GENERATED LATER WHEN THE NOTE IS SAVED.
 // ============================================================
 
 exports.generateLessonNote = async (req, res) => {
@@ -1422,11 +2143,7 @@ exports.generateLessonNote = async (req, res) => {
         const context = getUserContext(req);
 
         if (!context) {
-            return sendError(
-                res,
-                403,
-                'Invalid account or school administrator information.'
-            );
+            return sendError(res, 403, 'Invalid account.');
         }
 
         if (!GROQ_API_KEY) {
@@ -1465,19 +2182,15 @@ exports.generateLessonNote = async (req, res) => {
             );
         }
 
-        if (typeof topic !== 'string' || !topic.trim()) {
+        if (
+            typeof topic !== 'string' ||
+            !topic.trim() ||
+            topic.trim().length > 300
+        ) {
             return sendError(
                 res,
                 400,
-                'Please enter the lesson topic.'
-            );
-        }
-
-        if (topic.trim().length > 300) {
-            return sendError(
-                res,
-                400,
-                'Lesson topic must not exceed 300 characters.'
+                'Please enter a valid topic not exceeding 300 characters.'
             );
         }
 
@@ -1489,6 +2202,17 @@ exports.generateLessonNote = async (req, res) => {
                 res,
                 400,
                 'Additional instructions must be text.'
+            );
+        }
+
+        if (
+            additionalInstructions &&
+            additionalInstructions.length > 3000
+        ) {
+            return sendError(
+                res,
+                400,
+                'Additional instructions cannot exceed 3000 characters.'
             );
         }
 
@@ -1549,11 +2273,7 @@ exports.generateLessonNote = async (req, res) => {
         });
 
         if (!selectedTerm) {
-            return sendError(
-                res,
-                404,
-                'Selected academic term was not found.'
-            );
+            return sendError(res, 404, 'Academic term not found.');
         }
 
         const selectedWeek = await prisma.eNoteWeek.findFirst({
@@ -1593,97 +2313,101 @@ exports.generateLessonNote = async (req, res) => {
         const extraInstructions =
             String(additionalInstructions || 'None').slice(0, 3000);
 
-        const systemPrompt = `
-You are an experienced Nigerian secondary school teacher,
-professional curriculum developer and educational content writer.
-
-Prepare comprehensive, accurate and well-structured lesson notes
-for Nigerian schools.
-
-Use clear educational English suitable for the specified class,
-subject and age group.
-
-Use Nigerian educational examples where appropriate.
-
-Do not claim that a lesson has been officially verified by NERDC.
-
-Do not invent official curriculum references, textbook editions,
-page numbers or examination requirements.
-
-Ensure scientific, mathematical and technical explanations are accurate.
-
-Return ONLY valid JSON. Do not include Markdown code fences.
-`;
+        const template = createLessonTemplate({
+            subjectName,
+            className,
+            classLevel,
+            termName,
+            weekTitle,
+            topic: cleanTopic,
+            duration,
+            subTopics: topicSubTopics,
+        });
 
         const userPrompt = `
-Prepare a comprehensive teacher's lesson note.
+GENERATE AN ADVANCED, COMPREHENSIVE TEACHER'S LESSON NOTE.
 
 SCHOOL CLASS: ${className}
+
 CLASS LEVEL: ${classLevel}
+
 SUBJECT: ${subjectName}
+
 ACADEMIC TERM: ${termName}
+
 SCHOOL E-NOTES WEEK: ${weekTitle}
+
 LESSON TOPIC: ${cleanTopic}
-LESSON DURATION: ${duration} minutes
+
+LESSON DURATION: ${duration} MINUTES
 
 TEACHER-PROVIDED SUBTOPICS:
-${JSON.stringify(topicSubTopics)}
+${JSON.stringify(topicSubTopics, null, 2)}
 
-ADDITIONAL INSTRUCTIONS:
+ADDITIONAL TEACHER INSTRUCTIONS:
 ${extraInstructions}
 
-Include:
+CONTENT EXPECTATIONS:
 
-1. Lesson title
-2. Subject and class information
-3. Learning objectives
-4. Instructional materials
-5. Previous knowledge
-6. Introduction
-7. Detailed lesson content
-8. Practical examples
-9. Teacher activities
-10. Student activities
-11. Evaluation questions
-12. Lesson summary
-13. Assignment
-14. References where reliable references are known
+1. Produce textbook-style explanations suitable for the specified class.
+2. Cover all teacher-provided subtopics.
+3. Expand the topic into logical lesson sections.
+4. Explain all important concepts thoroughly.
+5. Include definitions and relevant terminology.
+6. Include multiple practical examples.
+7. Include at least three worked examples where appropriate.
+8. Use LaTeX for mathematical expressions.
+9. Include formulas and their explanations where relevant.
+10. Include step-by-step calculations where relevant.
+11. Include scientific units and symbols where relevant.
+12. Include practical applications.
+13. Include diagram descriptions that teachers can use to draw or explain diagrams.
+14. Include likely student misconceptions and corrections.
+15. Include activities suitable for classroom teaching.
+16. Include differentiated learning for students requiring additional support and advanced learners.
+17. Include at least 10 meaningful evaluation questions where appropriate.
+18. Include answers and marking guidance.
+19. Include meaningful assignments.
+20. Include reliable textbook references where known.
+21. Never fabricate references, page numbers or authors.
+22. Maintain age and class-level suitability.
+23. Avoid unnecessary repetition.
+24. Ensure every explanation is educationally useful.
 
-Provide detailed explanations, not just headings.
+MATHEMATICAL OUTPUT:
 
-Return JSON using this structure:
+Use:
+\\( ... \\) for inline equations.
 
-${JSON.stringify({
-    title: 'Lesson title',
-    subject: subjectName,
-    className,
-    classLevel,
-    term: termName,
-    week: weekTitle,
-    topic: cleanTopic,
-    subTopics: [],
-    lessonDuration: duration,
-    learningObjectives: [],
-    instructionalMaterials: [],
-    previousKnowledge: '',
-    introduction: '',
-    lessonContent: [
-        {
-            heading: '',
-            explanation: '',
-            examples: [],
-        },
-    ],
-    teacherActivities: [],
-    studentActivities: [],
-    evaluationQuestions: [],
-    summary: '',
-    assignment: [],
-    references: [],
-}, null, 2)}
+Use:
+\\[ ... \\] for display equations.
 
-All list fields must be arrays.
-All explanations must be meaningful and detailed.
+Example:
+\\[F = ma\\]
+
+For a quadratic equation:
+\\[x = \\frac{-b \\pm \\sqrt{b^2-4ac}}{2a}\\]
+
+For chemical reactions:
+\\[2H_2 + O_2 \\rightarrow 2H_2O\\]
+
+Return the lesson using this JSON structure:
+
+${JSON.stringify(template, null, 2)}
+
+IMPORTANT:
+
+- Return every field in the template.
+- All list fields must be arrays.
+- Use objects for structured worked examples.
+- Use valid JSON strings.
+- Do not return undefined values.
+- Do not use Markdown code fences.
+- Do not place raw unescaped quotation marks inside JSON strings.
+- Mathematical expressions must use valid LaTeX.
+- If a section is genuinely irrelevant to the selected subject, return an empty array.
+- Do not fill sections with meaningless placeholder content.
+- Prioritize educational accuracy over unnecessary length.
 `;
 
         const completion = await groq.chat.completions.create({
@@ -1692,7 +2416,7 @@ All explanations must be meaningful and detailed.
             messages: [
                 {
                     role: 'system',
-                    content: systemPrompt,
+                    content: SYSTEM_PROMPT,
                 },
                 {
                     role: 'user',
@@ -1700,8 +2424,9 @@ All explanations must be meaningful and detailed.
                 },
             ],
 
-            temperature: 0.5,
-            max_tokens: 8000,
+            temperature: 0.45,
+
+            max_tokens: 16000,
 
             response_format: {
                 type: 'json_object',
@@ -1720,8 +2445,43 @@ All explanations must be meaningful and detailed.
             !Array.isArray(generatedContent.lessonContent)
         ) {
             throw new Error(
-                'The AI response did not contain a valid lesson note.'
+                'The AI response did not contain a valid comprehensive lesson note.'
             );
+        }
+
+        if (completion.choices?.[0]?.finish_reason === 'length') {
+            throw new Error(
+                'The AI response reached its output limit and may be incomplete. Please generate the lesson again.'
+            );
+        }
+
+        normalizeLessonContent(generatedContent);
+
+        // Ensure important lesson information is retained.
+
+        generatedContent.subject =
+            generatedContent.subject || subjectName;
+
+        generatedContent.className =
+            generatedContent.className || className;
+
+        generatedContent.classLevel =
+            generatedContent.classLevel || classLevel;
+
+        generatedContent.term =
+            generatedContent.term || termName;
+
+        generatedContent.week =
+            generatedContent.week || weekTitle;
+
+        generatedContent.topic =
+            generatedContent.topic || cleanTopic;
+
+        generatedContent.lessonDuration =
+            generatedContent.lessonDuration || duration;
+
+        if (!generatedContent.subTopics.length) {
+            generatedContent.subTopics = topicSubTopics;
         }
 
         const creatorData = getCreatorData(context);
@@ -1744,11 +2504,13 @@ All explanations must be meaningful and detailed.
             topic: cleanTopic,
 
             subTopics: topicSubTopics,
+
             lessonDuration: duration,
 
             curriculumSource: 'Teacher-entered topic',
 
             title: generatedContent.title.trim(),
+
             content: generatedContent,
 
             aiProvider: 'groq',
@@ -1769,19 +2531,31 @@ All explanations must be meaningful and detailed.
         });
 
         console.log(
-            '[AI LESSON NOTE] Draft created. ID:',
+            '[RGSS ADVANCED AI LESSON NOTE] Draft created:',
             savedNote.id
         );
 
         return res.status(201).json({
             success: true,
+
             message:
-                'Lesson note generated successfully. Review it and save it to create the PDF.',
+                'Comprehensive AI lesson note generated successfully. Review the content and save it to generate the mathematical PDF.',
+
             note: removePdfBinary(savedNote),
+
+            generation: {
+                provider: 'groq',
+                model: GROQ_MODEL,
+                latexSupported: true,
+                advancedContent: true,
+            },
         });
 
     } catch (error) {
-        console.error('[AI LESSON NOTE GENERATION ERROR]:', error);
+        console.error(
+            '[ADVANCED AI LESSON NOTE GENERATION ERROR]:',
+            error
+        );
 
         if (error.status === 429) {
             return sendError(
@@ -1898,7 +2672,11 @@ exports.updateLessonNote = async (req, res) => {
                 );
             }
 
-            updateData.content = content;
+            const normalizedContent = normalizeLessonContent({
+                ...content,
+            });
+
+            updateData.content = normalizedContent;
         }
 
         if (subTopics !== undefined) {
@@ -1958,6 +2736,7 @@ exports.updateLessonNote = async (req, res) => {
                 id: noteId,
                 ...accessFilter,
             },
+
             data: updateData,
         });
 
@@ -1978,8 +2757,10 @@ exports.updateLessonNote = async (req, res) => {
 
         return res.json({
             success: true,
+
             message:
                 'Lesson note updated successfully. Save it again to generate its updated PDF.',
+
             note: removePdfBinary(note),
         });
 
@@ -2013,7 +2794,7 @@ exports.saveLessonNote = async (req, res) => {
             return sendError(
                 res,
                 503,
-                'Cloudinary is not configured. Please configure your Cloudinary environment variables.'
+                'Cloudinary is not configured. Check your environment variables.'
             );
         }
 
@@ -2040,16 +2821,16 @@ exports.saveLessonNote = async (req, res) => {
             return sendError(
                 res,
                 400,
-                'This lesson note has invalid content and cannot be converted to PDF.'
+                'Invalid lesson note content.'
             );
         }
 
         console.log(
-            '[AI LESSON NOTE] Generating PDF for note:',
+            '[RGSS] Generating advanced mathematical PDF:',
             noteId
         );
 
-        // Generate the professionally designed PDF.
+        // Generate PDF including LaTeX equations.
 
         const pdfBuffer = await generateLessonNotePdf(existingNote);
 
@@ -2060,7 +2841,7 @@ exports.saveLessonNote = async (req, res) => {
         const pdfFilename =
             `${safeFilename(existingNote.title)}-${noteId}-${Date.now()}.pdf`;
 
-        // Upload PDF to Cloudinary.
+        // Upload PDF.
 
         const uploadResult = await uploadPdfToCloudinary(
             pdfBuffer,
@@ -2069,12 +2850,7 @@ exports.saveLessonNote = async (req, res) => {
 
         uploadedPdfPublicId = uploadResult.pdfPublicId;
 
-        console.log(
-            '[AI LESSON NOTE] PDF uploaded to Cloudinary:',
-            uploadResult.pdfUrl
-        );
-
-        // Save PDF metadata in PostgreSQL.
+        // Update database.
 
         const updatedNoteResult = await prisma.aILessonNote.updateMany({
             where: {
@@ -2100,7 +2876,7 @@ exports.saveLessonNote = async (req, res) => {
             );
         }
 
-        // Remove the previous PDF after the new PDF is saved.
+        // Remove previous PDF only after successful update.
 
         if (
             existingNote.pdfPublicId &&
@@ -2119,14 +2895,16 @@ exports.saveLessonNote = async (req, res) => {
         uploadedPdfPublicId = null;
 
         console.log(
-            '[AI LESSON NOTE] Saved successfully with Cloudinary PDF. ID:',
+            '[RGSS] Advanced lesson note saved:',
             noteId
         );
 
         return res.json({
             success: true,
+
             message:
-                'Lesson note saved successfully and PDF uploaded to Cloudinary.',
+                'Advanced lesson note saved successfully. Mathematical expressions have been processed for the PDF.',
+
             note: removePdfBinary(note),
         });
 
@@ -2220,6 +2998,7 @@ exports.getLessonNotes = async (req, res) => {
 
         const notes = await prisma.aILessonNote.findMany({
             where,
+
             orderBy: {
                 updatedAt: 'desc',
             },
@@ -2332,7 +3111,7 @@ exports.getLessonNotePdf = async (req, res) => {
             return sendError(
                 res,
                 404,
-                'PDF is not available for this lesson note. Save the lesson note to generate it.'
+                'PDF is not available. Save the lesson note to generate it.'
             );
         }
 
